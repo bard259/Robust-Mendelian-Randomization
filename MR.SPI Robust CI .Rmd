@@ -1,0 +1,302 @@
+---
+title: "Lab"
+author: "Peijun Xu"
+date: "9/22/2023"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+setwd('/Users/ivanxu/Desktop/PhD/Robust MR-SPI CI')
+library(devtools)
+devtools::install_github("MinhaoYaooo/MR-SPI", force = TRUE)
+library(CVXR)
+library(MR.SPI)
+library(bigstatsr)
+library(igraph)
+library(intervals)
+library(matrixStats)
+library(svMisc)
+options(warn=0)
+```
+Step1: Find the smallest lower bound and largest upper bound by only using half the selected IV.
+
+Short-term: iterate selected IV value
+Long-term: optimization algorithm
+```{r}
+robust_ci_temp <- function(gamma, Gamma, se_gamma, se_Gamma, alpha=0.05,n1=10000,n2=20000) {
+  pz = length(Gamma)
+
+  V_gamma <- matrix(nrow = pz, ncol = pz)
+  V_Gamma <- matrix(nrow = pz, ncol = pz)
+  
+  for (i in 1:pz) {
+    for (j in i:pz) {
+      if(i==j){
+        V_gamma[i,i] <- se_gamma[i]^2
+        V_Gamma[i,i] <- se_Gamma[i]^2
+      }else{
+        V_gamma[i,j] <- V_gamma[j,i] <- gamma[i]*gamma[j] / n1
+        V_Gamma[i,j] <- V_Gamma[j,i] <- Gamma[i]*Gamma[j] / n2
+      }
+    }
+  } # Construct V_gamma_hat and V_Gamma_hat
+  L1 <- 100
+  U1 <- -100
+  L2 <- 100
+  U2 <- -100
+  comb <- combn(c(1:pz),pz%/%2+1)
+  for (i in 1:dim(comb)[2]){
+    excl.index <- combn(c(1:pz),pz%/%2+1)[,i]
+    betaVarHat.i <- var_TSHT(gamma[-excl.index],Gamma[-excl.index],V_gamma[-excl.index,-excl.index],V_Gamma[-excl.index,-excl.index])
+    betaHat.i <- sum(gamma[-excl.index] * Gamma[-excl.index]) / sum(gamma[-excl.index]^2)
+    if (betaHat.i - stats::qnorm(1-alpha/2) * sqrt(betaVarHat.i) < L1){
+      L1 <- betaHat.i - stats::qnorm(1-alpha/2) * sqrt(betaVarHat.i)
+    }
+    if (betaHat.i + stats::qnorm(1-alpha/2) * sqrt(betaVarHat.i) > U1){
+      U1 <- betaHat.i + stats::qnorm(1-alpha/2) * sqrt(betaVarHat.i)
+    }
+    loose_ci=c(L1,U1)
+    excl.index <- combn(c(1:pz),pz%/%2)[,i]
+    betaVarHat.i <- var_TSHT(gamma[-excl.index],Gamma[-excl.index],V_gamma[-excl.index,-excl.index],V_Gamma[-excl.index,-excl.index])
+    betaHat.i <- sum(gamma[-excl.index] * Gamma[-excl.index]) / sum(gamma[-excl.index]^2)
+    if (betaHat.i - stats::qnorm(1-alpha/2) * sqrt(betaVarHat.i) < L2){
+      L2 <- betaHat.i - stats::qnorm(1-alpha/2) * sqrt(betaVarHat.i)
+    }
+    if (betaHat.i + stats::qnorm(1-alpha/2) * sqrt(betaVarHat.i) > U2){
+      U2 <- betaHat.i + stats::qnorm(1-alpha/2) * sqrt(betaVarHat.i)
+    }
+    strict_ci=c(L2,U2)
+  }
+  
+  return(list(loose_ci=loose_ci, strict_ci=strict_ci))
+}
+
+
+
+```
+
+Step2: Combine the bound found in step1 with the Robust CI found using MR.SPI.
+```{r}
+generate_example <- function(n1=10000, n2=20000, beta=0.5, tau=0.2, gamma=0.25*c(1,1,1,1,1,-1,-1,-1,-1,-1), pi=0.25*c(0,0,0,0,0,0,1,1,1,1)) {
+  pSNP <- runif(10, 0.05, 0.95)  # generate allele frequency
+  Z1 <- sapply(pSNP, rbinom, n = n1, size = 2) # generate raw genotype of sample 1
+  Z1 <- scale(Z1)
+  Z2 <- sapply(pSNP, rbinom, n = n2, size = 2) # generate raw genotype of sample 2
+  Z2 <- scale(Z2)
+  D1 <- Z1 %*% gamma + rnorm(n1, 0, 1) # generate the exposure of sample 1
+  epsilonSigma = matrix(c(1,0.8,0.8,1),2,2)
+  epsilon = MASS::mvrnorm(n2,rep(0,2),epsilonSigma)
+  D2 <- Z2 %*% gamma + epsilon[,1] # generate the exposure of sample 2
+  Y2 <- D2*beta + Z2 %*% pi + epsilon[,2] # generate the outcome of sample 2
+  GWAS1 <- big_univLinReg(X = as_FBM(Z1), y.train = D1) # calculate summary statistics of D~Z
+  GWAS2 <- big_univLinReg(X = as_FBM(Z2), y.train = Y2) # calculate summary statistics of Y~Z
+  GammaHat = as.numeric(GWAS2$estim); gammaHat = as.numeric(GWAS1$estim) 
+  se_Gamma <- as.numeric(GWAS2$std.err); se_gamma <- as.numeric(GWAS1$std.err);
+  return(list(GammaHat=GammaHat,gammaHat=gammaHat,se_Gamma=se_Gamma,se_gamma=se_gamma,n1=n1,n2=n2))
+}
+```
+10 IV
+```{r}
+sim.result5 <- data.frame()
+
+
+pi_list <- list(c(rep(0,6),rep(1,4)),c(rep(0,4),rep(1,3),rep(-1,3)),c(rep(0,6),-1,-1,1,1),c(rep(0,4),1,1,0.25,-1,-1,-0.25)
+  c(rep(0,6),rep(0.25,4)),c(rep(0,4),rep(0.25,3),rep(-0.25,3)),c(rep(0,6),-0.25,-0.25,0.25,0.25),c(rep(0,4),1,0.25,0.25,-1,-0.25,-0.25))
+for (pi in pi_list){
+  print(pi)
+  l = robust_l = robust_strict_l0 = robust_loose_l0 = robust_l1=0
+  u = robust_u = robust_strict_u0 = robust_loose_u0 = robust_u1=0
+  pi = 0.25*pi
+  cnt = robust_cnt = robust_cnt0_loose = robust_cnt0_strict = robust_cnt1=0
+  time.default = time.robust = time.robust0 = 0
+  max_iter <- 1000
+  pb <- txtProgressBar(min = 0, max = max_iter, style = 3)
+  for (i in 1:max_iter){
+    setTxtProgressBar(pb, i)
+    result <- generate_example(beta=0.5, pi=pi)
+    t1 <- Sys.time()
+    mr.spi.default <- MR.SPI(result$gammaHat, result$GammaHat, result$se_gamma, result$se_Gamma, result$n1, result$n2,verbose=FALSE)
+    # print(c(mr.spi.robust$ci[[1]][1],mr.spi.robust$ci[[2]]))
+    t2 <- Sys.time()
+    suppressWarnings(mr.spi.robust <-MR.SPI(result$gammaHat, result$GammaHat, result$se_gamma, result$se_Gamma, result$n1, result$n2, M=1000,robust = TRUE,verbose=FALSE))
+    t3 <- Sys.time()
+    robust_ci_0 <- robust_ci_temp(gamma = result$gammaHat[mr.spi.default$VHat[[1]]],
+                                  Gamma = result$GammaHat[mr.spi.default$VHat[[1]]],
+                                  se_gamma = result$se_gamma,
+                                  se_Gamma = result$se_Gamma
+                                  )
+    t4<-Sys.time()
+    if (mr.spi.default$ci[[1]][1]>0.5 | mr.spi.default$ci[[1]][2]<0.5){
+      cnt <- cnt + 1
+    }
+    if (mr.spi.robust$ci[[1]][1]>0.5 | mr.spi.robust$ci[[2]]<0.5){
+      robust_cnt <- robust_cnt + 1
+    }
+    if (robust_ci_0$loose_ci[1]>0.5 | robust_ci_0$loose_ci[2]<0.5){
+      robust_cnt0_loose <- robust_cnt0_loose + 1
+    }
+    if (robust_ci_0$strict_ci[1]>0.5 | robust_ci_0$strict_ci[2]<0.5){
+      robust_cnt0_strict <- robust_cnt0_strict + 1
+    }
+    robust_l1_t <- max(mr.spi.robust$ci[[1]][1],robust_ci_0$strict_ci[1])
+    robust_u1_t <- min(mr.spi.robust$ci[[2]],robust_ci_0$strict_ci[2])
+    if (robust_l1_t>0.5 | robust_u1_t<0.5){
+      robust_cnt1 <- robust_cnt1 + 1
+    }  
+    time.default <- time.default + (t2 - t1)
+    time.robust <- time.robust + (t3 - t2)
+    time.robust0 <- time.robust0 + (t4 - t3)
+    
+    l <- l+mr.spi.default$ci[[1]][1]
+    u <- u+mr.spi.default$ci[[1]][2]
+    
+    robust_l <- robust_l+mr.spi.robust$ci[[1]][1]
+    robust_u <- robust_u+mr.spi.robust$ci[[2]]
+  
+    robust_loose_l0 <- robust_loose_l0+robust_ci_0$loose_ci[1]
+    robust_loose_u0 <- robust_loose_u0+robust_ci_0$loose_ci[2]
+    
+    robust_strict_l0 <- robust_strict_l0+robust_ci_0$strict_ci[1]
+    robust_strict_u0 <- robust_strict_u0+robust_ci_0$strict_ci[2]
+    
+    robust_l1 <- robust_l1+robust_l1_t
+    robust_u1 <- robust_u1+robust_u1_t
+  }
+  close(pb)
+  
+  sim.result5 <- rbind(sim.result5, data.frame(
+    #beta = beta,
+    # tau = tau,
+    #gamma = gamma,
+    coverage = 1-cnt/max_iter,
+    ci_length = u/max_iter-l/max_iter,
+    robust_ci_length = robust_u/max_iter-robust_l/max_iter,
+    robust_loose_ci0_length = robust_loose_u0/max_iter-robust_loose_l0/max_iter,
+    robust_strict_ci0_length = robust_strict_u0/max_iter-robust_strict_l0/max_iter,
+    robust_ci1_length = robust_u1/max_iter-robust_l1/max_iter,
+    robust_coverage = 1-robust_cnt/max_iter,
+    robust_coverage0_loose = 1-robust_cnt0_loose/max_iter,
+    robust_coverage0_strict = 1-robust_cnt0_strict/max_iter,
+    robust_coverage1 = 1-robust_cnt1/max_iter,
+    time.default <- time.default/max_iter,
+    time.robust <- time.robust/max_iter,
+    time.robust0 <- time.robust0/max_iter
+  ))
+}
+```
+
+
+100 IV
+```{r}
+sim.result.100 <- data.frame()
+
+
+pi_list <- list(c(rep(0,60),rep(1,40)),c(rep(0,40),rep(1,30),rep(-1,30)),c(rep(0,60),rep(-1,20),rep(1,20)),c(rep(0,40),rep(1,20),rep(0.25,10),rep(-1,20),rep(-0.25,10)),
+  c(rep(0,60),rep(0.25,40)),c(rep(0,40),rep(0.25,30),rep(-0.25,30)),c(rep(0,60),,rep(-0.25,20),rep(0.25,20)),c(rep(0,40),rep(1,10),rep(0.25,20),rep(-1,10),rep(-0.25,20))
+for (pi in pi_list){
+  print(pi)
+  l = robust_l = robust_strict_l0 = robust_loose_l0 = robust_l1=0
+  u = robust_u = robust_strict_u0 = robust_loose_u0 = robust_u1=0
+  pi = 0.25*pi
+  cnt = robust_cnt = robust_cnt0_loose = robust_cnt0_strict = robust_cnt1=0
+  time.default = time.robust = time.robust0 = 0
+  max_iter <- 1000
+  pb <- txtProgressBar(min = 0, max = max_iter, style = 3)
+  for (i in 1:max_iter){
+    setTxtProgressBar(pb, i)
+    result <- generate_example(beta=0.5, pi=pi)
+    t1 <- Sys.time()
+    mr.spi.default <- MR.SPI(result$gammaHat, result$GammaHat, result$se_gamma, result$se_Gamma, result$n1, result$n2,verbose=FALSE)
+    # print(c(mr.spi.robust$ci[[1]][1],mr.spi.robust$ci[[2]]))
+    t2 <- Sys.time()
+    suppressWarnings(mr.spi.robust <-MR.SPI(result$gammaHat, result$GammaHat, result$se_gamma, result$se_Gamma, result$n1, result$n2, M=1000,robust = TRUE,verbose=FALSE))
+    t3 <- Sys.time()
+    robust_ci_0 <- robust_ci_temp(gamma = result$gammaHat[mr.spi.default$VHat[[1]]],
+                                  Gamma = result$GammaHat[mr.spi.default$VHat[[1]]],
+                                  se_gamma = result$se_gamma,
+                                  se_Gamma = result$se_Gamma
+                                  )
+    t4<-Sys.time()
+    if (mr.spi.default$ci[[1]][1]>0.5 | mr.spi.default$ci[[1]][2]<0.5){
+      cnt <- cnt + 1
+    }
+    if (mr.spi.robust$ci[[1]][1]>0.5 | mr.spi.robust$ci[[2]]<0.5){
+      robust_cnt <- robust_cnt + 1
+    }
+    if (robust_ci_0$loose_ci[1]>0.5 | robust_ci_0$loose_ci[2]<0.5){
+      robust_cnt0_loose <- robust_cnt0_loose + 1
+    }
+    if (robust_ci_0$strict_ci[1]>0.5 | robust_ci_0$strict_ci[2]<0.5){
+      robust_cnt0_strict <- robust_cnt0_strict + 1
+    }
+    robust_l1_t <- max(mr.spi.robust$ci[[1]][1],robust_ci_0$strict_ci[1])
+    robust_u1_t <- min(mr.spi.robust$ci[[2]],robust_ci_0$strict_ci[2])
+    if (robust_l1_t>0.5 | robust_u1_t<0.5){
+      robust_cnt1 <- robust_cnt1 + 1
+    }  
+    time.default <- time.default + (t2 - t1)
+    time.robust <- time.robust + (t3 - t2)
+    time.robust0 <- time.robust0 + (t4 - t3)
+    
+    l <- l+mr.spi.default$ci[[1]][1]
+    u <- u+mr.spi.default$ci[[1]][2]
+    
+    robust_l <- robust_l+mr.spi.robust$ci[[1]][1]
+    robust_u <- robust_u+mr.spi.robust$ci[[2]]
+  
+    robust_loose_l0 <- robust_loose_l0+robust_ci_0$loose_ci[1]
+    robust_loose_u0 <- robust_loose_u0+robust_ci_0$loose_ci[2]
+    
+    robust_strict_l0 <- robust_strict_l0+robust_ci_0$strict_ci[1]
+    robust_strict_u0 <- robust_strict_u0+robust_ci_0$strict_ci[2]
+    
+    robust_l1 <- robust_l1+robust_l1_t
+    robust_u1 <- robust_u1+robust_u1_t
+  }
+  close(pb)
+  
+  sim.result5 <- rbind(sim.result5, data.frame(
+    #beta = beta,
+    # tau = tau,
+    #gamma = gamma,
+    coverage = 1-cnt/max_iter,
+    ci_length = u/max_iter-l/max_iter,
+    robust_ci_length = robust_u/max_iter-robust_l/max_iter,
+    robust_loose_ci0_length = robust_loose_u0/max_iter-robust_loose_l0/max_iter,
+    robust_strict_ci0_length = robust_strict_u0/max_iter-robust_strict_l0/max_iter,
+    robust_ci1_length = robust_u1/max_iter-robust_l1/max_iter,
+    robust_coverage = 1-robust_cnt/max_iter,
+    robust_coverage0_loose = 1-robust_cnt0_loose/max_iter,
+    robust_coverage0_strict = 1-robust_cnt0_strict/max_iter,
+    robust_coverage1 = 1-robust_cnt1/max_iter,
+    time.default <- time.default/max_iter,
+    time.robust <- time.robust/max_iter,
+    time.robust0 <- time.robust0/max_iter
+  ))
+}
+```
+
+The new robust CI garantees the CI length is smaller then the robust CI found using MR-SPI and simulation results show it has over 95% coverage. 
+```{r}
+sim.result_short <- data.frame(
+  # default_ci_length = sim.result5$ci_length,
+  robust_ci_length = sim.result5$robust_ci_length,
+  new_robust_ci_length = sim.result5$robust_ci1_length,
+  trim_bound_length = sim.result5$robust_strict_ci0_length,
+  # default_coverage = sim.result5$coverage,
+  robust_coverage = sim.result5$robust_coverage,
+  new_robust_coverage = sim.result5$robust_coverage1,
+  trime_bound_coverage = sim.result5$robust_coverage0_strict
+)
+rownames(sim.result_short) <- c("(0,0,0,0,0,0,0.25,0.25,0.25,0.25)",
+                          "(0, 0,0,0,0.25,0.25,0.25,-0.25,-0.25,-0.25)",
+                          "(0,0,0,0,0,0,0,-0.25,-0.25.25,0.25)",
+                          "(0,0,0,0,1,-0.25,0.25,-1,--0.25,-0.25)")
+print(sim.result_short)
+```
+
